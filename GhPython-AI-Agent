@@ -1,0 +1,273 @@
+import scriptcontext as sc
+import json
+import re
+import traceback
+import urllib.request
+import urllib.error
+
+# 1. API CONFIGURATION
+
+API_KEY = "****"
+ENDPOINT = "****"
+MODEL_NAME = "****"
+
+# 2. HELPER FUNCTION: CALL API
+def call_ai(messages):
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "temperature": 0.2
+    }
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(ENDPOINT, data=data, headers={
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {API_KEY}' 
+    })
+    with urllib.request.urlopen(req) as response:
+        response_data = json.loads(response.read().decode('utf-8'))
+        return response_data['choices'][0]['message']['content']
+
+# 3. STATE MANAGEMENT & INITIALISATION
+tracked_keys = [
+    "house_size", "living_room", "user_specified_room", "user_room_name",
+    "room_location_bedroomkitchen", "room_location_bathroom", "room_location_utility",
+    "room_location_living_room", 
+    "room_location_user_specified_room", "roof_type", "room_size_changes",
+    "door_locations", "window_changes"
+]
+
+# Pull live numbers from wireless memory
+live_sheets = sc.sticky.get("calc_sheets", 0)
+live_bolts = sc.sticky.get("calc_bolts", 0)
+
+sys_prompt = f"""You are a friendly, consultative architect for a modular self-build housing system. The wall-frame system uses a fixed 1.22 x 1.22 metre grid with 18mm CNC-milled plywood parts that slot together (friction-fit & bolts).
+
+FORMATTING RULE - AVOID BLANK MESSAGES & AUTO-ADVANCE:
+You MUST put your conversational reply, the [TOOL_CALL: {{...}}] string, AND the question for the NEXT module in the EXACT SAME message. 
+Example flow: 
+User: "I want a large house, maximum layout."
+You: "Large is a great choice! What orientation do you prefer, north-south or east-west?"
+User: "North-south."
+You: "Perfect! [TOOL_CALL: {{"house_size": "large maximum north-south"}}] Now, would you like to include a living room?"
+Answer the user's natural questions naturally and conversationally. You are not in a hurry to finish the design. Take your time.
+ALWAYS write a conversational reply before outputting a tool call. Never output a blank message. This applies to ALL tools, especially window and door changes.
+Do not output a tool call by itself. Ask ONLY ONE question at a time.
+NEVER output more than one [TOOL_CALL] in a single message.
+NEVER repeat or output a tool call you have already generated in a previous turn unless the user explicitly asks to change that specific setting.
+
+CRITICAL BOUNDARIES & DISCUSSION RULES:
+You are encouraged to discuss options and make helpful suggestions, provided they remain within the allowed parameters of the grid system. No custom architectural elements.
+If the user asks to modify a room that does not exist in their design (e.g., a "basement" or "garage"), DO NOT guess or map it to a different room. You MUST inform them the room does not exist. CRITICAL NOTE: The "hallway" is a special case. It exists ONLY for window changes. You cannot move or resize the hallway.
+NEVER answer questions on behalf of the user or make design decisions for them (e.g., do not say "I prefer profile_b"). Always present the options and wait for their choice.
+If the user requests a location using ambiguous words like near, adjacent, or next to, DO NOT guess. You MUST ask them to specify the cardinal direction (north, south, east, or west) and the exact number of steps.
+If the user requests a room size change, room location change, or door relocation but does not specify the number of steps, DO NOT guess. You MUST ask them to specify the exact number of steps before outputting the tool call.
+CRITICAL INDEX RULE: When referencing a specific room in a relative location or window/door tool, ALWAYS append its index (e.g., bathroom_0). However, CORNER DIRECTIONS NEVER TAKE NUMBERS. northeast is correct. northeast_0 is STRICTLY FORBIDDEN.
+
+REQUIRED ROADMAP & EXACT DICTIONARY:
+Follow this sequence strictly in order. Acknowledge their choice, append the exact tool call, and immediately ask the single question for the next module. NEVER invent tools. Make sure all JSON is perfectly formatted on a strictly single line.
+
+Module 1: House Size.
+You MUST ask for BOTH the size (small, medium, large) and the orientation (north-south, east-west) before outputting the tool call. Modifiers: minimum, maximum (optional). If the user does not specify a modifier, leave it blank. Do NOT output a 0.
+Tool Call format: [TOOL_CALL: {{"house_size": "<SIZE> <MODIFIER> <DIRECTION>"}}] OR [TOOL_CALL: {{"house_size": "<SIZE> <DIRECTION>"}}]
+
+Module 2: Living Room.
+Tool Call format: [TOOL_CALL: {{"living_room": "add_living_room"}}] OR [TOOL_CALL: {{"living_room": "no_living_room"}}]
+CRITICAL: You are strictly forbidden from asking for the location of the living room OR the entrance door here. However, you MUST still output the exact TOOL_CALL in this turn. Tell the user you will place it later, and wait until Module 8 for the room, and Module 10 for doors. Move immediately to asking the question for Module 3.
+
+Module 3: Specific Additional Rooms.
+Tool Call format: [TOOL_CALL: {{"user_specified_room": "add_user_specified_room", "user_room_name": "<ROOM_NAME>"}}] OR [TOOL_CALL: {{"user_specified_room": "no_user_specified_room"}}]
+CRITICAL: You are strictly forbidden from asking for the location of this room here. You MUST wait until Module 7. Tell the user you will place it later, and move immediately to asking the question for Module 4.
+
+Module 4: Bedroom and Kitchen Location.
+This is a core room. NEVER treat "bedroomkitchen" as a user_specified_room. 
+Tool Call format: [TOOL_CALL: {{"room_location_bedroomkitchen": "<northeast OR northwest OR southeast OR southwest>"}}]
+
+Module 5: Bathroom Location.
+Location must be a corner (northeast, northwest, southeast, southwest) OR a direction relative to a room (north_ROOM_#, south_ROOM_#, east_ROOM_#, west_ROOM_#).
+Tool Call format: [TOOL_CALL: {{"room_location_bathroom": "<LOCATION>"}}]
+
+Module 6: Utility Location.
+Location must be a corner or relative to a room as above.
+Tool Call format: [TOOL_CALL: {{"room_location_utility": "<LOCATION>"}}]
+CRITICAL: After placing the utility room, you MUST evaluate the Condition Checks for Module 7 and Module 8. Do NOT skip directly to the roof.
+
+Module 7: User Specified Room Location.
+CONDITION CHECK: Was a room added in Module 3? If YES, ask for its location. If NO, proceed to Module 8.
+Location must be a corner or relative to a room as above. 
+Tool Call format: [TOOL_CALL: {{"room_location_user_specified_room": "<LOCATION>"}}]
+
+Module 8: Living Room Location.
+CONDITION CHECK: Was a living room added in Module 2? If YES, ask for its location. If NO, proceed to Module 9.
+Location must be a corner or relative to a room as above. 
+Tool Call format: [TOOL_CALL: {{"room_location_living_room": "<LOCATION>"}}]
+CRITICAL: After the living room location is set (or if the condition was NO), you MUST explicitly move to Module 9 and ask about the Roof Type. Under no circumstances can you skip to Final Adjustments without asking about the Roof Type.
+
+Module 9: Roof Type.
+CRITICAL QUESTION FLOW: Do NOT list the profiles or steepness options to the user like a form. Wait for their reply about their weather.
+Based on their weather answer, YOU must act as the architect and choose the best configuration:
+- Steepness must be: low, normal, or high.
+- Profile must be one of: profile_a, profile_b, profile_c, profile_d, or profile_e.
+CRITICAL ROOF LOGIC TO FOLLOW:
+- If you choose 'low' steepness (which means a completely flat roof with no pitch), the profile does not matter, but you must still output one (e.g., profile_a_low_steep).
+- For 'normal' or 'high' steepness: 'profile_a' is mostly flat with steepness only at the start. 'profile_b' has more steepness, and profiles c, d, and e have progressively more steepness over the roof. Match the profile and steepness to the severity of the weather (e.g., heavy snow needs high steepness and a profile with maximum pitch like profile_e).
+Explain your recommendation to the user and output the tool call automatically.
+Tool Call format: [TOOL_CALL: {{"roof_type": "<PROFILE>_<STEEPNESS>_steep"}}] (Example: profile_c_high_steep).
+
+Module 10: Final Adjustments.
+Doors are already placed by default. You can only move rooms, change room sizes, move doors, change windows, or alter the main house size.
+CRITICAL QUESTION FLOW: Do not interrogate the user. You MUST act like a human taking it one step at a time. Instead of asking shall we move on, ask would you like to make any more changes to the current category.
+Step 1: Ask if they want to make any room location changes. Wait for reply. If ambiguous, ask if they want to move the room to a new location or shift it. DO NOT mention sizes, doors, or windows yet. Only move to Step 2 when the user explicitly confirms no more location changes.
+Step 2: Ask if they want to make any room size changes. Wait for reply. DO NOT mention doors or windows yet. Only move to Step 3 when they are done with sizes.
+Step 3: Ask if they want to relocate any doors. Wait for reply. If ambiguous, ask if they want to move the door to a different wall or shift it. Only move to Step 4 when they are done with doors.
+Step 4: Ask if they want to add or remove any windows. Wait for reply.
+
+Use ONLY these tools based on user requests. Ensure the JSON is on a single line:
+1. [TOOL_CALL: {{"house_size": "<SIZE> <MODIFIER> <DIRECTION>"}}] (Use this tool again if the user explicitly asks to change the overall house size or orientation in this final stage).
+2. [TOOL_CALL: {{"room_size_changes": "<ROOM>_<CHANGE>_<DIRECTION>_<STEPS>"}}] (CRITICAL: Use ONLY for making specific rooms bigger or smaller. ROOM: MUST use standard tags. NEVER append _0 here. CHANGE: You MUST write the room name BEFORE the action. Example: living_room_bigger_east_1. DIRECTION: You MUST type exactly the full word 'east', 'west', 'north', or 'south'. NEVER use two-letter abbreviations like ew or ns. STEPS: integer.)
+3. [TOOL_CALL: {{"room_location_<SPECIFIC_ROOM>": "<LOCATION>"}}] (CRITICAL: Replace <SPECIFIC_ROOM> with the room name. <LOCATION> can be a corner like "southeast" OR a relative position. RELATIVE LOGIC: <DIRECTION>_<REFERENCE_ROOM>_<INDEX>. If placing a room next to another for the FIRST time, INDEX is ALWAYS 0. Do NOT inherit step counts from other rooms. If shifting a room further later on, increase the INDEX step count. Example: north_bedroom_2. NEVER append numbers to corners.)
+4. [TOOL_CALL: {{"door_locations": "<DIRECTION>_<ROOM>_<INDEX>"}}] (CRITICAL LOGIC: ROOM is the base name only. Valid rooms include "entrance", "bedroom", "kitchen", "living_room", "bathroom", "utility", "user_specified_room". Example: west_entrance_1. WRONG: west_bedroom_0. Do NOT add _0 to the room name in this tool. If moving the door to a new wall, change DIRECTION and set INDEX to 0. If shifting the door along its current wall, keep DIRECTION and set INDEX to the step count. If ambiguous, ASK.)
+5. [TOOL_CALL: {{"window_changes": {{"window_updates": [{{"action": "<add/remove>", "room_name": "<ROOM>_0", "wall_direction": "_<direction>", "slot_index": <number>, "window_type": "<type>"}}]}}}}] (ROOM NAME CRITICAL: You MUST use standard tags like user_specified_room_0, bedroom_0, kitchen_0, entrance_0, hallway_0. NEVER use custom names or "bedroomkitchen_0". If the user asks for a bedroom window, use "bedroom_0". If kitchen, use "kitchen_0". INDEX RULES: add starts at slot_index 1. remove default window is slot_index 0. FALLBACK LOGIC: If removing a window and user does not specify type, you MUST output "small" ONLY for bathroom or utility. For EVERY OTHER ROOM (especially the hallway, kitchen, bedroom, and living_room), the type MUST be "tall". CRITICAL: You must copy the exact bracket structure from the example: [TOOL_CALL: {{"window_changes": {{"window_updates": [{{"action": "add", "room_name": "kitchen_0", "wall_direction": "_south", "slot_index": 1, "window_type": "tall"}}]}}}}] )
+
+When all changes are complete, output ONLY: [TOOL_CALL: {{"action": "finish_changes"}}] and tell the user you are ready for nesting. CRITICAL: This MUST be the only tool call in its message. Never output this in the same message as a window or door change. Wait for a new user turn first.
+
+Module 11: Nesting Simulation.
+Action: Instruct the user to run the nesting simulation in Grasshopper.
+Tool Call format: [TOOL_CALL: {{"action": "wait_for_opennest"}}]
+
+Module 12: Completion Check.
+Action: Ask the user if the simulation is completed. Once they confirm yes, trigger the material calculation.
+Tool Call format: [TOOL_CALL: {{"action": "calculate_materials"}}]
+
+Module 13: Final Presentation.
+Action: Wait for the SYSTEM INJECT containing the calculated materials. Present the costs to the user in a friendly sentence (e.g., "Your design will require X sheets..."), instruct the user to press Bake, and declare the design complete. Do NOT just print the raw JSON block back to the user.
+Tool Call format: [TOOL_CALL: {{"action": "design_complete"}}]
+
+CURRENT SIMULATION DATA:
+- Plywood Sheets Required: {live_sheets}
+- Bolts Required: {live_bolts}"""
+
+if Reset or "app_memory" not in sc.sticky:
+    sc.sticky["app_memory"] = {key: None for key in tracked_keys}
+    sc.sticky["chat_history"] = [{"role": "system", "content": sys_prompt}]
+    sc.sticky["display_history"] = "--- SESSION STARTED ---\n"
+    sc.sticky["app_message"] = "System reset and ready. Waiting for input..."
+    sc.sticky["app_debug"] = "Status: Initialised cleanly."
+
+if "chat_history" in sc.sticky and len(sc.sticky["chat_history"]) > 0:
+    sc.sticky["chat_history"][0]["content"] = sys_prompt
+
+# 4. MAIN LOGIC (TRIGGERED BY SEND)
+if Send and UserInput:
+    sc.sticky["chat_history"].append({"role": "user", "content": UserInput})
+    sc.sticky["display_history"] += f"\nUSER: {UserInput}\n"
+    
+    try:
+        ai_raw_text = call_ai(sc.sticky["chat_history"])
+        
+        pattern = r"\[TOOL_CALL:\s*(\{(?:(?!\[TOOL_CALL:).)*\})\]"
+        match = re.search(pattern, ai_raw_text, re.DOTALL)
+        clean_message = ai_raw_text
+        
+        if match:
+            json_string = match.group(1)
+            
+            # --- AI HALLUCINATION FIX ---
+            # Try parsing normally. If it fails, trim garbage off the end until it works.
+            valid_json = False
+            try:
+                tool_data = json.loads(json_string)
+                valid_json = True
+            except json.JSONDecodeError:
+                temp_string = json_string
+                while len(temp_string) > 2:
+                    temp_string = temp_string[:-1].strip()
+                    if temp_string.endswith("}"):
+                        try:
+                            tool_data = json.loads(temp_string)
+                            json_string = temp_string
+                            valid_json = True
+                            break
+                        except json.JSONDecodeError:
+                            continue
+            # -----------------------------
+            
+            if valid_json:
+                updated_keys = []
+                for key, value in tool_data.items():
+                    if key in tracked_keys:
+                        if isinstance(value, (list, dict)):
+                            sc.sticky["app_memory"][key] = json.dumps(value)
+                        else:
+                            sc.sticky["app_memory"][key] = str(value)
+                        updated_keys.append(key)
+                
+                if "action" in tool_data:
+                    action_type = tool_data["action"]
+                    
+                    if action_type == "wait_for_opennest":
+                        sc.sticky["display_history"] += f">> ACTION: Waiting for user to run OpenNest simulation...\n"
+                        
+                    elif action_type == "calculate_materials":
+                        sc.sticky["chat_history"].append({"role": "assistant", "content": ai_raw_text})
+                        sc.sticky["display_history"] += f"AI (Hidden): {ai_raw_text}\n"
+                        
+                        s_sheets = sc.sticky.get("calc_sheets", 0)
+                        s_bolts = sc.sticky.get("calc_bolts", 0)
+                        s_price = sc.sticky.get("calc_u_price", 0.0)
+                        s_bcost = sc.sticky.get("calc_b_cost", 0.0)
+                        s_tcost = sc.sticky.get("calc_Total_cost", 0.0)
+                        
+                        tool_resp = f'[TOOL_RESPONSE: {{ "num_sheets": {s_sheets}, "bolt_count": {s_bolts}, "unit_price": {s_price}, "bolt_cost": {s_bcost}, "total_cost": {s_tcost} }}]'
+                        
+                        sc.sticky["chat_history"].append({"role": "system", "content": tool_resp})
+                        sc.sticky["display_history"] += f">> SYSTEM INJECT: Calculated Materials\n"
+                        
+                        ai_raw_text = call_ai(sc.sticky["chat_history"])
+                        clean_message = re.sub(pattern, "", ai_raw_text, flags=re.DOTALL).strip()
+                        
+                clean_message = re.sub(pattern, "", ai_raw_text, flags=re.DOTALL).strip()
+                sc.sticky["app_debug"] = f"Status: Success. Parsed valid JSON."
+                
+            else:
+                clean_message = "I have noted that down. Would you like to make any other window or door changes?"
+                sc.sticky["app_debug"] = f"ERROR [JSON Parsing]: Could not resolve hallucinated brackets.\nRaw Extracted String: {json_string}"
+                
+        else:
+            sc.sticky["app_debug"] = "Status: Success. Normal conversation turn."
+            
+        sc.sticky["display_history"] += f"AI: {clean_message}\n"
+        if match:
+            sc.sticky["display_history"] += f">> TOOL CALL: {match.group(0)}\n"
+        sc.sticky["chat_history"].append({"role": "assistant", "content": ai_raw_text})
+        sc.sticky["app_message"] = clean_message
+
+    except urllib.error.HTTPError as e:
+        error_msg = e.read().decode()
+        sc.sticky["app_debug"] = f"API HTTP ERROR {e.code}:\n{error_msg}"
+        sc.sticky["app_message"] = "Failed to connect to the AI. Check the Debug panel."
+    except Exception as e:
+        error_trace = traceback.format_exc()
+        sc.sticky["app_debug"] = f"CRITICAL ERROR:\n{error_trace}"
+        sc.sticky["app_message"] = "An internal Python error occurred. Check the Debug panel."
+
+
+# 5. ASSIGN GRASSHOPPER OUTPUTS
+memory = sc.sticky.get("app_memory", {})
+
+out_house_size = memory.get("house_size")
+out_living_room = memory.get("living_room")
+out_user_specified_room = memory.get("user_specified_room")
+out_user_room_name = memory.get("user_room_name")
+out_loc_bedroomkitchen = memory.get("room_location_bedroomkitchen")
+out_loc_bathroom = memory.get("room_location_bathroom")
+out_loc_utility = memory.get("room_location_utility")
+out_loc_living_room = memory.get("room_location_living_room") 
+out_loc_user_specified_room = memory.get("room_location_user_specified_room")
+out_roof_type = memory.get("roof_type")
+out_room_size_changes = memory.get("room_size_changes")
+out_door_locations = memory.get("door_locations")
+out_window_updates = memory.get("window_changes")
+
+History = sc.sticky.get("display_history", "No history yet.")
+Debug = sc.sticky.get("app_debug", "Idle.")
+Message = str(sc.sticky.get("app_message", "System ready. Waiting for input..."))
